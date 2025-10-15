@@ -22,7 +22,7 @@ app.post('/login', (req, res) => {
         if (data.length > 0) {
             return res.json("Login Successful"); 
         } else {
-            return res.json("No record found");
+            return res.status(401).send('Credenciales inválidas');
         }
     })
 })
