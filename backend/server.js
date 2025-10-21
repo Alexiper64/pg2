@@ -21,6 +21,60 @@ const db = mysql.createConnection({
     database: 'crud'
 })
 
+// Helper: recompute monto for a factura from detallefacturacion
+function recomputeMonto(facturaId, cb) {
+    const sqlMonto = 'SELECT COALESCE(SUM(cantidad * precio_unitario), 0) AS monto FROM detallefacturacion WHERE facturacion_id = ?';
+    db.query(sqlMonto, [facturaId], (err, rows) => {
+        if (err) return cb(err);
+        const monto = (rows && rows[0] && rows[0].monto) ? Number(rows[0].monto) : 0;
+        cb(null, monto);
+    });
+}
+
+// Helper: ensure there's a ventas row for this factura and sync its monto
+function syncFacturaVentaMonto(facturaId) {
+    // recompute monto first
+    recomputeMonto(facturaId, (err, monto) => {
+        if (err) { console.error('Error recomputing monto for factura', facturaId, err); return; }
+        // check if factura has venta_id and then create/update venta inside a transaction
+        db.query('SELECT venta_id, fecha, cliente_id FROM facturacion WHERE id = ?', [facturaId], (errF, rowsF) => {
+            if (errF || !rowsF || !rowsF[0]) { if (errF) console.error('Error reading factura for sync', errF); return; }
+            const ventaId = rowsF[0].venta_id;
+            const fecha = rowsF[0].fecha;
+            const cliente_id = rowsF[0].cliente_id;
+            db.beginTransaction(txErr => {
+                if (txErr) { console.error('Transaction start error for syncFacturaVentaMonto:', txErr); return; }
+                if (ventaId) {
+                    // update existing venta
+                    db.query('UPDATE ventas SET fecha = ?, cliente_id = ?, monto = ? WHERE id = ?', [fecha || null, cliente_id || null, monto || 0, ventaId], (eU) => {
+                        if (eU) {
+                            console.error('Error actualizando venta desde factura sync (rolling back):', eU);
+                            return db.rollback(() => {});
+                        }
+                        db.commit(cErr => { if (cErr) { console.error('Commit error updating venta:', cErr); db.rollback(() => {}); } });
+                    });
+                } else {
+                    // create venta and update factura.venta_id
+                    db.query('INSERT INTO ventas (fecha, cliente_id, monto) VALUES (?, ?, ?)', [fecha || null, cliente_id || null, monto || 0], (eI, rI) => {
+                        if (eI) {
+                            console.error('Error creando venta desde factura sync (rolling back):', eI);
+                            return db.rollback(() => {});
+                        }
+                        const newVentaId = rI.insertId;
+                        db.query('UPDATE facturacion SET venta_id = ? WHERE id = ?', [newVentaId, facturaId], (eUpd) => {
+                            if (eUpd) {
+                                console.error('Error guardando venta_id en facturacion (rolling back):', eUpd);
+                                return db.rollback(() => {});
+                            }
+                            db.commit(cErr => { if (cErr) { console.error('Commit error creating venta:', cErr); db.rollback(() => {}); } });
+                        });
+                    });
+                }
+            });
+        });
+    });
+}
+
 app.post('/login', (req, res) => {
     const sql = 'SELECT * FROM login WHERE username = ? AND password = ?';
 
@@ -385,7 +439,7 @@ app.delete('/detalle-compras/:id', (req, res) => {
 // Tabla `ventas`: id, fecha, cliente_id, monto
 app.get('/ventas', (req, res) => {
     // Join with clientes to include cliente name
-    let sql = 'SELECT ventas.id, ventas.fecha, ventas.cliente_id, clientes.nombre AS cliente, ventas.monto FROM ventas LEFT JOIN clientes ON ventas.cliente_id = clientes.id';
+    let sql = 'SELECT ventas.id, ventas.fecha, ventas.cliente_id, clientes.nombre AS cliente, ventas.monto, f.id AS factura_id FROM ventas LEFT JOIN clientes ON ventas.cliente_id = clientes.id LEFT JOIN facturacion f ON f.venta_id = ventas.id';
     const params = [];
     if (req.query.fecha_inicio && req.query.fecha_fin) {
         sql += ' WHERE ventas.fecha BETWEEN ? AND ?';
@@ -407,7 +461,7 @@ app.get('/ventas', (req, res) => {
 });
 
 app.get('/ventas/:id', (req, res) => {
-    const sql = 'SELECT ventas.id, ventas.fecha, ventas.cliente_id, clientes.nombre AS cliente, ventas.monto FROM ventas LEFT JOIN clientes ON ventas.cliente_id = clientes.id WHERE ventas.id = ?';
+    const sql = 'SELECT ventas.id, ventas.fecha, ventas.cliente_id, clientes.nombre AS cliente, ventas.monto, f.id AS factura_id FROM ventas LEFT JOIN clientes ON ventas.cliente_id = clientes.id LEFT JOIN facturacion f ON f.venta_id = ventas.id WHERE ventas.id = ?';
     db.query(sql, [req.params.id], (err, results) => {
         if (err) {
             console.error('Error al obtener venta:', err);
@@ -579,7 +633,7 @@ app.delete('/inventarios/:id', (req, res) => {
 // Obtener todas las facturas (incluir nombre de cliente)
 app.get('/facturacion', (req, res) => {
     // Include a precomputed monto (sum of cantidad * precio_unitario) per factura
-    let sql = 'SELECT f.id, f.fecha, f.cliente_id, CONCAT(c.nombre, " ", IFNULL(c.apellido, "")) AS cliente, COALESCE(t.monto, 0) AS monto '
+    let sql = 'SELECT f.id, f.fecha, f.cliente_id, f.venta_id, CONCAT(c.nombre, " ", IFNULL(c.apellido, "")) AS cliente, COALESCE(t.monto, 0) AS monto '
             + 'FROM facturacion f '
             + 'LEFT JOIN clientes c ON f.cliente_id = c.id '
             + 'LEFT JOIN (SELECT facturacion_id, SUM(cantidad * precio_unitario) AS monto FROM detallefacturacion GROUP BY facturacion_id) t ON f.id = t.facturacion_id';
@@ -646,6 +700,7 @@ app.get('/facturacion/:id', (req, res) => {
                     id: factura.id,
                     fecha: factura.fecha,
                     monto,
+                    venta_id: factura.venta_id || null,
                     // if the DB has an observaciones column it wasn't selected; default to empty string
                     observaciones: factura.observaciones || '',
                     cliente: {
@@ -702,6 +757,8 @@ app.post('/facturacion/:id/detalle', (req, res) => {
                 console.error('Error al crear detalle de factura:', err);
                 return res.status(500).json({ error: 'Error al crear detalle de factura' });
             }
+            // sync monto -> ventas
+            syncFacturaVentaMonto(facturaId);
             res.status(201).json({ id: result.insertId, facturacion_id: facturaId, producto_id, cantidad, precio_unitario: precio_unitario || 0 });
         });
     });
@@ -739,6 +796,10 @@ app.put('/detallefacturacion/:id', (req, res) => {
                         return res.status(500).json({ error: 'Error al actualizar detalle de factura' });
                     }
                     if (resultUpd.affectedRows === 0) return res.status(404).json({ error: 'Detalle no encontrado' });
+                    // sync monto
+                    db.query('SELECT facturacion_id FROM detallefacturacion WHERE id = ?', [itemId], (e2, r2) => {
+                        if (!e2 && r2 && r2[0]) syncFacturaVentaMonto(r2[0].facturacion_id);
+                    });
                     res.json({ message: 'Detalle de factura actualizado' });
                 });
             });
@@ -759,14 +820,24 @@ app.put('/detallefacturacion/:id', (req, res) => {
 
 // Eliminar un item de factura
 app.delete('/detallefacturacion/:id', (req, res) => {
-    const sql = 'DELETE FROM detallefacturacion WHERE id = ?';
-    db.query(sql, [req.params.id], (err, result) => {
-        if (err) {
-            console.error('Error al eliminar detalle de factura:', err);
-            return res.status(500).json({ error: 'Error al eliminar detalle de factura' });
+    const itemId = req.params.id;
+    // capture factura_id before deleting to sync monto afterwards
+    db.query('SELECT facturacion_id FROM detallefacturacion WHERE id = ?', [itemId], (errSelect, rowsSel) => {
+        if (errSelect) {
+            console.error('Error obteniendo detalle antes de eliminar:', errSelect);
+            return res.status(500).json({ error: 'Error interno' });
         }
-        if (result.affectedRows === 0) return res.status(404).json({ error: 'Detalle no encontrado' });
-        res.json({ message: 'Detalle de factura eliminado' });
+        const facturaId = rowsSel && rowsSel[0] ? rowsSel[0].facturacion_id : null;
+        const sql = 'DELETE FROM detallefacturacion WHERE id = ?';
+        db.query(sql, [itemId], (err, result) => {
+            if (err) {
+                console.error('Error al eliminar detalle de factura:', err);
+                return res.status(500).json({ error: 'Error al eliminar detalle de factura' });
+            }
+            if (result.affectedRows === 0) return res.status(404).json({ error: 'Detalle no encontrado' });
+            if (facturaId) syncFacturaVentaMonto(facturaId);
+            res.json({ message: 'Detalle de factura eliminado' });
+        });
     });
 });
 
@@ -780,7 +851,10 @@ app.post('/facturacion', (req, res) => {
             console.error('Error al crear factura:', err);
             return res.status(500).json({ error: 'Error al crear factura' });
         }
-        res.status(201).json({ id: result.insertId, fecha, cliente_id });
+        const newId = result.insertId;
+        // create/sync venta record (will create ventas row and update factura.venta_id)
+        syncFacturaVentaMonto(newId);
+        res.status(201).json({ id: newId, fecha, cliente_id, venta_id: null });
     });
 });
 
