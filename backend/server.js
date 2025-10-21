@@ -256,7 +256,7 @@ app.delete('/productos/:id', (req, res) => {
 app.get('/compras', (req, res) => {
     // Optional date range filters: fecha_inicio, fecha_fin in YYYY-MM-DD
     // Join with proveedores to include proveedor name
-    let sql = 'SELECT compras.id, compras.fecha, compras.proveedor_id, proveedores.nombre AS proveedor, compras.total FROM compras LEFT JOIN proveedores ON compras.proveedor_id = proveedores.id';
+    let sql = 'SELECT compras.id, compras.fecha, compras.proveedor_id, proveedores.nombre AS proveedor, compras.monto FROM compras LEFT JOIN proveedores ON compras.proveedor_id = proveedores.id';
     const params = [];
     if (req.query.fecha_inicio && req.query.fecha_fin) {
         sql += ' WHERE compras.fecha BETWEEN ? AND ?';
@@ -278,7 +278,7 @@ app.get('/compras', (req, res) => {
 });
 
 app.get('/compras/:id', (req, res) => {
-    const sql = 'SELECT compras.id, compras.fecha, compras.proveedor_id, proveedores.nombre AS proveedor, compras.total FROM compras LEFT JOIN proveedores ON compras.proveedor_id = proveedores.id WHERE compras.id = ?';
+    const sql = 'SELECT compras.id, compras.fecha, compras.proveedor_id, proveedores.nombre AS proveedor, compras.monto FROM compras LEFT JOIN proveedores ON compras.proveedor_id = proveedores.id WHERE compras.id = ?';
     db.query(sql, [req.params.id], (err, results) => {
         if (err) {
             console.error('Error al obtener compra:', err);
@@ -292,7 +292,7 @@ app.get('/compras/:id', (req, res) => {
 app.post('/compras', (req, res) => {
     const { fecha, proveedor_id, total } = req.body;
     if (!fecha || !proveedor_id) return res.status(400).json({ error: 'fecha y proveedor_id son requeridos' });
-    const sql = 'INSERT INTO compras (fecha, proveedor_id, total) VALUES (?, ?, ?)';
+    const sql = 'INSERT INTO compras (fecha, proveedor_id, monto) VALUES (?, ?, ?)';
     db.query(sql, [fecha, proveedor_id, total || 0], (err, result) => {
         if (err) {
             console.error('Error al crear compra:', err);
@@ -304,7 +304,7 @@ app.post('/compras', (req, res) => {
 
 app.put('/compras/:id', (req, res) => {
     const { fecha, proveedor_id, total } = req.body;
-    const sql = 'UPDATE compras SET fecha = ?, proveedor_id = ?, total = ? WHERE id = ?';
+    const sql = 'UPDATE compras SET fecha = ?, proveedor_id = ?, monto = ? WHERE id = ?';
     db.query(sql, [fecha || null, proveedor_id || null, total || 0, req.params.id], (err, result) => {
         if (err) {
             console.error('Error al actualizar compra:', err);
@@ -578,20 +578,25 @@ app.delete('/inventarios/:id', (req, res) => {
 
 // Obtener todas las facturas (incluir nombre de cliente)
 app.get('/facturacion', (req, res) => {
-    let sql = 'SELECT facturacion.id, facturacion.fecha, facturacion.cliente_id, CONCAT(clientes.nombre, " ", IFNULL(clientes.apellido, "")) AS cliente FROM facturacion LEFT JOIN clientes ON facturacion.cliente_id = clientes.id';
+    // Include a precomputed monto (sum of cantidad * precio_unitario) per factura
+    let sql = 'SELECT f.id, f.fecha, f.cliente_id, CONCAT(c.nombre, " ", IFNULL(c.apellido, "")) AS cliente, COALESCE(t.monto, 0) AS monto '
+            + 'FROM facturacion f '
+            + 'LEFT JOIN clientes c ON f.cliente_id = c.id '
+            + 'LEFT JOIN (SELECT facturacion_id, SUM(cantidad * precio_unitario) AS monto FROM detallefacturacion GROUP BY facturacion_id) t ON f.id = t.facturacion_id';
     const params = [];
     if (req.query.cliente_id) {
-        sql += ' WHERE facturacion.cliente_id = ?';
+        sql += ' WHERE f.cliente_id = ?';
         params.push(req.query.cliente_id);
     }
+    // Compare only the DATE portion so filters are inclusive of the full day
     if (req.query.fecha_inicio && req.query.fecha_fin) {
-        sql += params.length ? ' AND facturacion.fecha BETWEEN ? AND ?' : ' WHERE facturacion.fecha BETWEEN ? AND ?';
+        sql += params.length ? ' AND DATE(f.fecha) BETWEEN ? AND ?' : ' WHERE DATE(f.fecha) BETWEEN ? AND ?';
         params.push(req.query.fecha_inicio, req.query.fecha_fin);
     } else if (req.query.fecha_inicio) {
-        sql += params.length ? ' AND facturacion.fecha >= ?' : ' WHERE facturacion.fecha >= ?';
+        sql += params.length ? ' AND DATE(f.fecha) >= ?' : ' WHERE DATE(f.fecha) >= ?';
         params.push(req.query.fecha_inicio);
     } else if (req.query.fecha_fin) {
-        sql += params.length ? ' AND facturacion.fecha <= ?' : ' WHERE facturacion.fecha <= ?';
+        sql += params.length ? ' AND DATE(f.fecha) <= ?' : ' WHERE DATE(f.fecha) <= ?';
         params.push(req.query.fecha_fin);
     }
     db.query(sql, params, (err, results) => {
@@ -600,6 +605,168 @@ app.get('/facturacion', (req, res) => {
             return res.status(500).json({ error: 'Error al obtener facturas' });
         }
         res.json(results);
+    });
+});
+
+// Obtener factura por id con cliente y items (detallefacturacion)
+app.get('/facturacion/:id', (req, res) => {
+    const id = req.params.id;
+    // Note: some DBs may not have an 'observaciones' column; avoid selecting it directly to prevent ER_BAD_FIELD_ERROR
+    const sql = `SELECT f.id, f.fecha, f.cliente_id, c.empresa, c.nombre AS cliente_nombre, c.apellido, c.nit, c.telefono, c.correo_electronico AS correo, c.direccion
+                 FROM facturacion f
+                 LEFT JOIN clientes c ON f.cliente_id = c.id
+                 WHERE f.id = ?`;
+    db.query(sql, [id], (err, results) => {
+        if (err) {
+            console.error('Error al obtener factura:', err);
+            return res.status(500).json({ error: 'Error al obtener factura' });
+        }
+        if (results.length === 0) return res.status(404).json({ error: 'Factura no encontrada' });
+        const factura = results[0];
+
+        const sqlItems = `SELECT d.id, d.facturacion_id AS factura_id, d.producto_id, p.nombre AS descripcion, p.medida, d.cantidad, d.precio_unitario
+                          FROM detallefacturacion d
+                          LEFT JOIN productos p ON d.producto_id = p.id
+                          WHERE d.facturacion_id = ?`;
+        db.query(sqlItems, [id], (err2, items) => {
+            if (err2) {
+                console.error('Error al obtener items de factura:', err2);
+                return res.status(500).json({ error: 'Error al obtener items de factura' });
+            }
+            // compute monto (sum of cantidad * precio_unitario) for this factura
+            const sqlMonto = 'SELECT COALESCE(SUM(cantidad * precio_unitario), 0) AS monto FROM detallefacturacion WHERE facturacion_id = ?';
+            db.query(sqlMonto, [id], (errM, rowsM) => {
+                if (errM) {
+                    console.error('Error calculando monto de factura:', errM);
+                    return res.status(500).json({ error: 'Error al obtener monto de factura' });
+                }
+                const monto = (rowsM && rowsM[0] && rowsM[0].monto) ? Number(rowsM[0].monto) : 0;
+                // shape response to match frontend expectations
+                const response = {
+                    id: factura.id,
+                    fecha: factura.fecha,
+                    monto,
+                    // if the DB has an observaciones column it wasn't selected; default to empty string
+                    observaciones: factura.observaciones || '',
+                    cliente: {
+                        empresa: factura.empresa || '',
+                        nombre: factura.cliente_nombre || '',
+                        apellido: factura.apellido || '',
+                        nit: factura.nit || '',
+                        telefono: factura.telefono || '',
+                        correo: factura.correo || '',
+                        direccion: factura.direccion || ''
+                    },
+                    items: items.map(it => ({ id: it.id, producto_id: it.producto_id, descripcion: it.descripcion, medida: it.medida, cantidad: it.cantidad, precio_unitario: it.precio_unitario }))
+                };
+                res.json(response);
+            });
+        });
+    });
+});
+
+// Listar items de una factura
+app.get('/facturacion/:id/detalle', (req, res) => {
+    const id = req.params.id;
+    const sql = `SELECT d.id, d.facturacion_id AS factura_id, d.producto_id, p.nombre AS descripcion, p.medida, d.cantidad, d.precio_unitario
+                 FROM detallefacturacion d
+                 LEFT JOIN productos p ON d.producto_id = p.id
+                 WHERE d.facturacion_id = ?`;
+    db.query(sql, [id], (err, results) => {
+        if (err) {
+            console.error('Error al obtener detalle de factura:', err);
+            return res.status(500).json({ error: 'Error al obtener detalle de factura' });
+        }
+        res.json(results);
+    });
+});
+
+// Agregar item a una factura
+app.post('/facturacion/:id/detalle', (req, res) => {
+    const facturaId = req.params.id;
+    const { producto_id, cantidad, precio_unitario } = req.body;
+    if (!producto_id || !cantidad) return res.status(400).json({ error: 'producto_id y cantidad son requeridos' });
+    // Prevent duplicate producto per factura
+    const sqlCheck = 'SELECT COUNT(*) AS cnt FROM detallefacturacion WHERE facturacion_id = ? AND producto_id = ?';
+    db.query(sqlCheck, [facturaId, producto_id], (errChk, rowsChk) => {
+        if (errChk) {
+            console.error('Error comprobando duplicados en detalle de factura:', errChk);
+            return res.status(500).json({ error: 'Error interno' });
+        }
+        if (rowsChk && rowsChk[0] && rowsChk[0].cnt > 0) {
+            return res.status(400).json({ error: 'Producto ya agregado a esta factura' });
+        }
+        const sql = 'INSERT INTO detallefacturacion (facturacion_id, producto_id, cantidad, precio_unitario) VALUES (?, ?, ?, ?)';
+        db.query(sql, [facturaId, producto_id, cantidad, precio_unitario || 0], (err, result) => {
+            if (err) {
+                console.error('Error al crear detalle de factura:', err);
+                return res.status(500).json({ error: 'Error al crear detalle de factura' });
+            }
+            res.status(201).json({ id: result.insertId, facturacion_id: facturaId, producto_id, cantidad, precio_unitario: precio_unitario || 0 });
+        });
+    });
+});
+
+// Actualizar un item de factura (detallefacturacion)
+app.put('/detallefacturacion/:id', (req, res) => {
+    const { producto_id, cantidad, precio_unitario } = req.body;
+    const itemId = req.params.id;
+    const subtotal = (precio_unitario || 0) * Number(cantidad || 0);
+    // First get the factura id for this item
+    const sqlGet = 'SELECT facturacion_id FROM detallefacturacion WHERE id = ?';
+    db.query(sqlGet, [itemId], (errGet, rowsGet) => {
+        if (errGet) {
+            console.error('Error al obtener detalle de factura:', errGet);
+            return res.status(500).json({ error: 'Error interno' });
+        }
+        if (!rowsGet || rowsGet.length === 0) return res.status(404).json({ error: 'Detalle no encontrado' });
+        const facturaId = rowsGet[0].facturacion_id;
+        // If producto_id is provided, ensure no other line in the same factura uses it
+        if (producto_id) {
+            const sqlCheck = 'SELECT COUNT(*) AS cnt FROM detallefacturacion WHERE facturacion_id = ? AND producto_id = ? AND id != ?';
+            db.query(sqlCheck, [facturaId, producto_id, itemId], (errChk, rowsChk) => {
+                if (errChk) {
+                    console.error('Error comprobando duplicados en detalle de factura:', errChk);
+                    return res.status(500).json({ error: 'Error interno' });
+                }
+                if (rowsChk && rowsChk[0] && rowsChk[0].cnt > 0) {
+                    return res.status(400).json({ error: 'Producto ya agregado a esta factura en otra línea' });
+                }
+                const sql = 'UPDATE detallefacturacion SET producto_id = ?, cantidad = ?, precio_unitario = ? WHERE id = ?';
+                db.query(sql, [producto_id || null, cantidad || 0, precio_unitario || 0, itemId], (errUpd, resultUpd) => {
+                    if (errUpd) {
+                        console.error('Error al actualizar detalle de factura:', errUpd);
+                        return res.status(500).json({ error: 'Error al actualizar detalle de factura' });
+                    }
+                    if (resultUpd.affectedRows === 0) return res.status(404).json({ error: 'Detalle no encontrado' });
+                    res.json({ message: 'Detalle de factura actualizado' });
+                });
+            });
+        } else {
+            // No producto change, just update the row
+            const sql = 'UPDATE detallefacturacion SET producto_id = ?, cantidad = ?, precio_unitario = ? WHERE id = ?';
+            db.query(sql, [producto_id || null, cantidad || 0, precio_unitario || 0, itemId], (errUpd, resultUpd) => {
+                if (errUpd) {
+                    console.error('Error al actualizar detalle de factura:', errUpd);
+                    return res.status(500).json({ error: 'Error al actualizar detalle de factura' });
+                }
+                if (resultUpd.affectedRows === 0) return res.status(404).json({ error: 'Detalle no encontrado' });
+                res.json({ message: 'Detalle de factura actualizado' });
+            });
+        }
+    });
+});
+
+// Eliminar un item de factura
+app.delete('/detallefacturacion/:id', (req, res) => {
+    const sql = 'DELETE FROM detallefacturacion WHERE id = ?';
+    db.query(sql, [req.params.id], (err, result) => {
+        if (err) {
+            console.error('Error al eliminar detalle de factura:', err);
+            return res.status(500).json({ error: 'Error al eliminar detalle de factura' });
+        }
+        if (result.affectedRows === 0) return res.status(404).json({ error: 'Detalle no encontrado' });
+        res.json({ message: 'Detalle de factura eliminado' });
     });
 });
 
@@ -619,14 +786,37 @@ app.post('/facturacion', (req, res) => {
 
 // Eliminar factura
 app.delete('/facturacion/:id', (req, res) => {
-    const sql = 'DELETE FROM facturacion WHERE id = ?';
-    db.query(sql, [req.params.id], (err, result) => {
-        if (err) {
-            console.error('Error al eliminar factura:', err);
-            return res.status(500).json({ error: 'Error al eliminar factura' });
+    const facturaId = req.params.id;
+    // Use a transaction to remove detalle rows first to avoid FK constraint errors
+    db.beginTransaction(errTx => {
+        if (errTx) {
+            console.error('Transaction start error:', errTx);
+            return res.status(500).json({ error: 'Error interno' });
         }
-        if (result.affectedRows === 0) return res.status(404).json({ error: 'Factura no encontrada' });
-        res.json({ message: 'Factura eliminada' });
+        const sqlDelItems = 'DELETE FROM detallefacturacion WHERE facturacion_id = ?';
+        db.query(sqlDelItems, [facturaId], (err1) => {
+            if (err1) {
+                console.error('Error al eliminar items de factura:', err1);
+                return db.rollback(() => res.status(500).json({ error: 'Error al eliminar items de factura' }));
+            }
+            const sql = 'DELETE FROM facturacion WHERE id = ?';
+            db.query(sql, [facturaId], (err2, result) => {
+                if (err2) {
+                    console.error('Error al eliminar factura:', err2);
+                    return db.rollback(() => res.status(500).json({ error: 'Error al eliminar factura' }));
+                }
+                if (result.affectedRows === 0) {
+                    return db.rollback(() => res.status(404).json({ error: 'Factura no encontrada' }));
+                }
+                db.commit(commitErr => {
+                    if (commitErr) {
+                        console.error('Commit error:', commitErr);
+                        return db.rollback(() => res.status(500).json({ error: 'Error interno' }));
+                    }
+                    res.json({ message: 'Factura eliminada' });
+                });
+            });
+        });
     });
 });
 
