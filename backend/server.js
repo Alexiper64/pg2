@@ -156,6 +156,11 @@ app.delete('/clientes/:id', (req, res) => {
     db.query(sql, [req.params.id], (err, result) => {
         if (err) {
             console.error('Error al eliminar cliente:', err);
+            // MySQL foreign key constraint error (cannot delete parent row)
+            // errno 1451 typically means the row is referenced by a foreign key
+            if (err.errno === 1451) {
+                return res.status(409).json({ error: 'No se puede eliminar el cliente porque tiene registros relacionados (ventas o facturas). Elimine o desvincule esas referencias primero.' });
+            }
             return res.status(500).json({ error: 'Error al eliminar cliente' });
         }
         if (result.affectedRows === 0) return res.status(404).json({ error: 'Cliente no encontrado' });
