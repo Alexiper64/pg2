@@ -6,6 +6,7 @@
     "express": "^5.1.0",
     "mysql": "^2.18.1",
     "mysql2": "^3.15.2",
+  "puppeteer": "^20.10.2",
     "nodemon": "^3.1.10"
   },
   "name": "backend",

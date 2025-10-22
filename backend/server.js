@@ -439,7 +439,7 @@ app.delete('/detalle-compras/:id', (req, res) => {
 // Tabla `ventas`: id, fecha, cliente_id, monto
 app.get('/ventas', (req, res) => {
     // Join with clientes to include cliente name
-    let sql = 'SELECT ventas.id, ventas.fecha, ventas.cliente_id, clientes.nombre AS cliente, ventas.monto, f.id AS factura_id FROM ventas LEFT JOIN clientes ON ventas.cliente_id = clientes.id LEFT JOIN facturacion f ON f.venta_id = ventas.id';
+    let sql = 'SELECT ventas.id, ventas.fecha, ventas.cliente_id, clientes.nombre AS cliente, clientes.empresa AS empresa, ventas.monto, f.id AS factura_id FROM ventas LEFT JOIN clientes ON ventas.cliente_id = clientes.id LEFT JOIN facturacion f ON f.venta_id = ventas.id';
     const params = [];
     if (req.query.fecha_inicio && req.query.fecha_fin) {
         sql += ' WHERE ventas.fecha BETWEEN ? AND ?';
@@ -461,7 +461,7 @@ app.get('/ventas', (req, res) => {
 });
 
 app.get('/ventas/:id', (req, res) => {
-    const sql = 'SELECT ventas.id, ventas.fecha, ventas.cliente_id, clientes.nombre AS cliente, ventas.monto, f.id AS factura_id FROM ventas LEFT JOIN clientes ON ventas.cliente_id = clientes.id LEFT JOIN facturacion f ON f.venta_id = ventas.id WHERE ventas.id = ?';
+    const sql = 'SELECT ventas.id, ventas.fecha, ventas.cliente_id, clientes.nombre AS cliente, clientes.empresa AS empresa, ventas.monto, f.id AS factura_id FROM ventas LEFT JOIN clientes ON ventas.cliente_id = clientes.id LEFT JOIN facturacion f ON f.venta_id = ventas.id WHERE ventas.id = ?';
     db.query(sql, [req.params.id], (err, results) => {
         if (err) {
             console.error('Error al obtener venta:', err);
@@ -892,6 +892,118 @@ app.delete('/facturacion/:id', (req, res) => {
             });
         });
     });
+});
+
+// Generar PDF de factura en el servidor y devolverlo (usa puppeteer)
+app.get('/facturacion/:id/pdf', async (req, res) => {
+    const facturaId = req.params.id;
+    try {
+        // Reuse the same queries as GET /facturacion/:id
+        const facturaSql = `SELECT f.id, f.fecha, f.cliente_id, f.venta_id, c.empresa, c.nombre AS cliente_nombre, c.apellido, c.nit, c.telefono, c.correo_electronico AS correo, c.direccion
+                            FROM facturacion f
+                            LEFT JOIN clientes c ON f.cliente_id = c.id
+                            WHERE f.id = ?`;
+        const [facturaRows] = await new Promise((resolve, reject) => db.query(facturaSql, [facturaId], (err, rows) => err ? reject(err) : resolve([rows])));
+        if (!facturaRows || facturaRows.length === 0) return res.status(404).json({ error: 'Factura no encontrada' });
+        const factura = facturaRows[0];
+
+        const itemsSql = `SELECT d.id, d.facturacion_id AS factura_id, d.producto_id, p.nombre AS descripcion, p.medida, d.cantidad, d.precio_unitario
+                          FROM detallefacturacion d
+                          LEFT JOIN productos p ON d.producto_id = p.id
+                          WHERE d.facturacion_id = ?`;
+        const [itemsRows] = await new Promise((resolve, reject) => db.query(itemsSql, [facturaId], (err, rows) => err ? reject(err) : resolve([rows])));
+
+        const montoSql = 'SELECT COALESCE(SUM(cantidad * precio_unitario), 0) AS monto FROM detallefacturacion WHERE facturacion_id = ?';
+        const [montoRows] = await new Promise((resolve, reject) => db.query(montoSql, [facturaId], (err, rows) => err ? reject(err) : resolve([rows])));
+        const monto = (montoRows && montoRows[0] && montoRows[0].monto) ? Number(montoRows[0].monto) : 0;
+
+        // Build HTML (same structure as frontend/lib/invoicePdf)
+        const cliente = {
+            empresa: factura.empresa || '',
+            nombre: factura.cliente_nombre || '',
+            apellido: factura.apellido || '',
+            nit: factura.nit || '',
+            telefono: factura.telefono || '',
+            direccion: factura.direccion || ''
+        };
+        const items = (itemsRows || []).map(it => ({ id: it.id, descripcion: it.descripcion, medida: it.medida, cantidad: it.cantidad, precio_unitario: it.precio_unitario }));
+
+        function formatCurrency(v) {
+            return new Intl.NumberFormat('es-GT', { style: 'currency', currency: 'GTQ' }).format(Number(v || 0));
+        }
+
+        const rowsHtml = items.map(it => `
+            <tr>
+                <td style="width:8%">${it.id || ''}</td>
+                <td style="width:42%">${it.descripcion || ''}</td>
+                <td style="width:15%">${it.medida || ''}</td>
+                <td style="width:10%; text-align:right">${it.cantidad}</td>
+                <td style="width:12%; text-align:right">${formatCurrency(it.precio_unitario)}</td>
+                <td style="width:13%; text-align:right">${formatCurrency((Number(it.cantidad||0) * Number(it.precio_unitario||0)))}</td>
+            </tr>
+        `).join('');
+
+        const html = `
+            <html><head><meta charset="utf-8"><title>Factura ${factura.id}</title>
+            <style>body{font-family:Arial,Helvetica,sans-serif;color:#222} table{width:100%;border-collapse:collapse} th,td{padding:6px 8px;border-bottom:1px solid #eee}</style>
+            </head><body>
+            <div style="padding:20px;">
+                <div style="display:flex;justify-content:space-between;margin-bottom:20px;">
+                    <div>
+                        <h2>Factura</h2>
+                        <div><strong>No.:</strong> ${factura.id}</div>
+                        <div><strong>Fecha:</strong> ${factura.fecha}</div>
+                    </div>
+                    <div style="text-align:right">
+                        <div><strong>Cliente:</strong> ${cliente.nombre} ${cliente.apellido}</div>
+                        <div><strong>Empresa:</strong> ${cliente.empresa}</div>
+                        <div><strong>NIT:</strong> ${cliente.nit}</div>
+                        <div><strong>Tel:</strong> ${cliente.telefono}</div>
+                        <div><strong>Dirección:</strong> ${cliente.direccion}</div>
+                    </div>
+                </div>
+                <table>
+                    <thead><tr style="background:#f5f5f5;font-weight:700"><th>ID</th><th>Descripción</th><th>Medida</th><th style="text-align:right">Cantidad</th><th style="text-align:right">Precio unitario</th><th style="text-align:right">Monto</th></tr></thead>
+                    <tbody>${rowsHtml}</tbody>
+                </table>
+                <div style="display:flex;justify-content:flex-end;margin-top:20px;width:100%">
+                    <div style="width:260px">
+                        <div style="display:flex;justify-content:space-between"><div>Subtotal:</div><div>${formatCurrency(monto)}</div></div>
+                        <div style="display:flex;justify-content:space-between"><div>Impuestos:</div><div>${formatCurrency(0)}</div></div>
+                        <hr />
+                        <div style="display:flex;justify-content:space-between;font-weight:700"><div>Total:</div><div>${formatCurrency(monto)}</div></div>
+                    </div>
+                </div>
+            </div>
+            </body></html>`;
+
+        // Launch puppeteer and render PDF
+        let puppeteer;
+        try {
+            puppeteer = require('puppeteer');
+        } catch (e) {
+            console.error('Puppeteer not available:', e);
+            return res.status(503).json({ error: 'PDF generation not available on server: puppeteer not installed' });
+        }
+        let browser;
+        try {
+            browser = await puppeteer.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+        } catch (e) {
+            console.error('Error launching puppeteer:', e);
+            return res.status(500).json({ error: 'Error launching headless browser for PDF generation' });
+        }
+        const page = await browser.newPage();
+        await page.setContent(html, { waitUntil: 'networkidle0' });
+        const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true, margin: { top: '10mm', right: '10mm', bottom: '10mm', left: '10mm' } });
+        await browser.close();
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="factura_${factura.id}.pdf"`);
+        res.send(pdfBuffer);
+    } catch (err) {
+        console.error('Error generando PDF en servidor:', err);
+        res.status(500).json({ error: 'Error generando PDF' });
+    }
 });
 
 app.listen(8081, () => {
