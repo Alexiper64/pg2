@@ -917,7 +917,7 @@ app.get('/facturacion/:id/pdf', async (req, res) => {
         const [montoRows] = await new Promise((resolve, reject) => db.query(montoSql, [facturaId], (err, rows) => err ? reject(err) : resolve([rows])));
         const monto = (montoRows && montoRows[0] && montoRows[0].monto) ? Number(montoRows[0].monto) : 0;
 
-        // Build HTML (same structure as frontend/lib/invoicePdf)
+    // Build HTML (same structure as frontend/lib/invoicePdf)
         const cliente = {
             empresa: factura.empresa || '',
             nombre: factura.cliente_nombre || '',
@@ -942,13 +942,41 @@ app.get('/facturacion/:id/pdf', async (req, res) => {
                 <td style="width:13%; text-align:right">${formatCurrency((Number(it.cantidad||0) * Number(it.precio_unitario||0)))}</td>
             </tr>
         `).join('');
+        // If a template image exists, read header/footer and watermark images and embed as data URIs
+        const fs = require('fs');
+        const path = require('path');
+        let headerDataUri = null;
+        let footerDataUri = null;
+        try {
+            // no watermark; only header/footer from public assets
+            // header/footer from public assets
+            const headerCandidate = path.join(__dirname, '..', 'frontend', 'public', 'assets', 'factura_header.png');
+            const footerCandidate = path.join(__dirname, '..', 'frontend', 'public', 'assets', 'factura_footer.png');
+            if (fs.existsSync(headerCandidate)) {
+                const h = fs.readFileSync(headerCandidate);
+                headerDataUri = 'data:image/png;base64,' + h.toString('base64');
+            }
+            if (fs.existsSync(footerCandidate)) {
+                const f = fs.readFileSync(footerCandidate);
+                footerDataUri = 'data:image/png;base64,' + f.toString('base64');
+            }
+        } catch (e) {
+            console.error('Could not read invoice images:', e);
+        }
+
+    const watermarkHtml = '';
+        const headerHtml = headerDataUri ? `<div style="position:absolute;top:6mm;left:18mm;right:18mm;pointer-events:none;text-align:center;z-index:1"><img src="${headerDataUri}" style="width:100%;max-width:1100px;"/></div>` : '';
+        const footerHtml = footerDataUri ? `<div style="position:absolute;left:18mm;right:18mm;bottom:12mm;pointer-events:none;text-align:center;z-index:1"><img src="${footerDataUri}" style="width:100%;max-width:1100px;"/></div>` : '';
 
         const html = `
             <html><head><meta charset="utf-8"><title>Factura ${factura.id}</title>
             <style>body{font-family:Arial,Helvetica,sans-serif;color:#222} table{width:100%;border-collapse:collapse} th,td{padding:6px 8px;border-bottom:1px solid #eee}</style>
             </head><body>
-            <div style="padding:20px;">
-                <div style="display:flex;justify-content:space-between;margin-bottom:20px;">
+            <div style="position:relative;padding:20px 20px 36px 20px;">
+                ${watermarkHtml}
+                ${headerHtml}
+                ${footerHtml}
+                <div style="display:flex;justify-content:space-between;margin-top:20px;margin-bottom:20px;">
                     <div>
                         <h2>Factura</h2>
                         <div><strong>No.:</strong> ${factura.id}</div>
